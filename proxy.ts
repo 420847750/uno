@@ -256,4 +256,4 @@ async function handler(req: Request): Promise<Response> {
 
 // Start the server
 console.log("Universal Proxy server running on http://localhost:8000");
-serve(handler, { port: 8000 ,hostname: "0.0.0.0"});
+serve(handler, { port: 8000 });
