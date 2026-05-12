@@ -1,24 +1,233 @@
-import { serve } from "https://deno.land/std@0.180.0/http/server.ts";
+// Universal API Proxy for Deno Deploy
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-const target = "https://api.openai.com";
+function getApiKey(req: Request): string | null {
+  const url = new URL(req.url);
+  const authHeader = req.headers.get("Authorization");
+  const apiKeyFromAuth = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : null;
 
-async function handler(req: Request): Promise<Response> {
-  const { pathname, search } = new URL(req.url);
-  const url = target + pathname + search;
-
-  const headers = new Headers(req.headers);
-  headers.delete("host");
-  headers.set("host", new URL(target).host);
-
-  const response = await fetch(url, {
-    method: req.method,
-    headers,
-    body: req.body,
-    // @ts-ignore: Deno supports streaming body
-    duplex: "half",
-  });
-
-  return response;
+  // Support multiple API key retrieval methods
+  let envKey: string | null = null;
+  try {
+    envKey = typeof Deno !== "undefined" && Deno.env?.get
+      ? Deno.env.get("UNIVERSAL_API_KEY") ?? null
+      : null;
+  } catch {
+    envKey = null;
+  }
+  return url.searchParams.get("key") ||
+    apiKeyFromAuth ||
+    req.headers.get("x-api-key") ||
+    req.headers.get("x-goog-api-key") ||
+    envKey ||
+    null;
 }
 
-serve(handler);
+async function handler(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+
+  // Handle root path and static files
+  if (url.pathname === '/' || url.pathname === '/index.html') {
+    try {
+      // Read the index.html file
+      const fileContent = await Deno.readTextFile('./index.html');
+      return new Response(fileContent, {
+        status: 200,
+        headers: {
+          'Content-Type': 'text/html; charset=UTF-8',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    } catch (error) {
+      console.error("Error serving index.html:", error);
+      return new Response('Error loading test UI', {
+        status: 500,
+        headers: {
+          'Content-Type': 'text/plain',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+  }
+
+  // Handle token count update endpoint
+  if (url.pathname === '/updateTokenCount' && req.method === 'POST') {
+    try {
+      const body = await req.json();
+      const tokens = body.tokens || 0;
+      // Use Deno KV to store and update token count
+      const kv = await Deno.openKv();
+      const currentTotal = (await kv.get<number>(["tokenCount"])).value || 0;
+      const newTotal = currentTotal + tokens;
+      await kv.set(["tokenCount"], newTotal);
+      return new Response(JSON.stringify({ totalTokens: newTotal }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    } catch (error) {
+      console.error("Error updating token count:", error);
+      return new Response(JSON.stringify({ error: "Failed to update token count" }), {
+        status: 500,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
+      });
+    }
+  }
+
+  // Handle OPTIONS for CORS preflight
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, x-api-key, x-goog-api-key, Content-Type"
+      }
+    });
+  }
+
+  try {
+    const apiKey = getApiKey(req);
+    if (!apiKey) {
+      return new Response(JSON.stringify({
+        error: "API key required via Authorization header, x-api-key header or key query parameter"
+      }), {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    // Extract the target API domain from the URL path
+    const pathSegments = url.pathname.split('/').filter(segment => segment.length > 0);
+    if (pathSegments.length < 1) {
+      return new Response(JSON.stringify({
+        error: "Invalid URL format. Expected format: /[target-domain]/..."
+      }), {
+        status: 400,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      });
+    }
+
+    let targetDomain = pathSegments[0];
+    // 确保目标域名不包含协议前缀
+    targetDomain = targetDomain.replace(/^https?:\/\//, '');
+    const remainingPath = pathSegments.slice(1).join('/');
+    // 直接使用剩余路径，不做任何版本号添加或修改
+    const finalPath = remainingPath;
+    const targetBaseUrl = `https://${targetDomain}`;
+    const targetUrl = new URL(`${targetBaseUrl}/${finalPath}${url.search}`);
+
+    // Prepare headers to forward
+    const forwardHeaders = new Headers(req.headers);
+    forwardHeaders.delete('Host');
+    // Remove all possible client key headers
+    forwardHeaders.delete('Authorization');
+    forwardHeaders.delete('x-api-key');
+    forwardHeaders.delete('x-goog-api-key');
+
+    // Determine the API style based on the target domain and set the appropriate header
+    const isGoogleStyle = targetDomain.includes('generativelanguage.googleapis.com');
+    if (isGoogleStyle) {
+      forwardHeaders.set('X-Goog-Api-Key', apiKey);
+    } else {
+      forwardHeaders.set('Authorization', `Bearer ${apiKey}`);
+    }
+
+    console.log(`Forwarding Headers to ${targetDomain}:`, [...forwardHeaders.entries()]);
+
+    // Forward request
+    const apiResponse = await fetch(targetUrl.toString(), {
+      method: req.method,
+      headers: forwardHeaders,
+      body: req.body,
+    });
+
+    // Log basic response info
+    const contentType = apiResponse.headers.get('Content-Type');
+    const status = apiResponse.status;
+    console.log(`Response Status from ${targetDomain}: ${status}`);
+    console.log(`Response Content-Type from ${targetDomain}: ${contentType}`);
+
+    // Handle JSON responses specially for error debugging
+    if (contentType?.includes('application/json')) {
+      try {
+        const responseBodyText = await apiResponse.text();
+        console.error(`Received JSON body from ${targetDomain} (Status ${status}):`, responseBodyText);
+
+        const responseHeaders = new Headers(apiResponse.headers);
+        responseHeaders.delete('Content-Encoding');
+        responseHeaders.delete('Transfer-Encoding');
+        responseHeaders.set('Access-Control-Allow-Origin', '*');
+        responseHeaders.set('Content-Type', 'application/json; charset=UTF-8');
+
+        return new Response(responseBodyText, {
+          status: status,
+          headers: responseHeaders
+        });
+      } catch (e) {
+        console.error("Error processing JSON response:", e);
+        return new Response(JSON.stringify({
+          error: `Failed to process response from ${targetDomain}`,
+          details: e instanceof Error ? e.message : String(e)
+        }), {
+          status: 500,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+          }
+        });
+      }
+    }
+    // Handle SSE streams normally
+    else if (contentType?.includes('text/event-stream')) {
+      const responseHeaders = new Headers(apiResponse.headers);
+      responseHeaders.delete('Content-Encoding');
+      responseHeaders.delete('Transfer-Encoding');
+      responseHeaders.set('Access-Control-Allow-Origin', '*');
+
+      console.log('Forwarding SSE stream response');
+      return new Response(apiResponse.body, {
+        status: apiResponse.status,
+        headers: responseHeaders
+      });
+    }
+    // Handle other response types
+    else {
+      console.warn(`Unexpected Content-Type from ${targetDomain}: ${contentType}`);
+      const responseHeaders = new Headers(apiResponse.headers);
+      responseHeaders.set('Access-Control-Allow-Origin', '*');
+
+      return new Response(apiResponse.body, {
+        status: apiResponse.status,
+        headers: responseHeaders
+      });
+    }
+
+  } catch (error) {
+    console.error("Proxy error:", error);
+    return new Response(JSON.stringify({
+      error: "Internal Server Error",
+      details: error instanceof Error ? error.message : String(error)
+    }), {
+      status: 500,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  }
+}
+
+// Start the server
+console.log("Universal Proxy server running on http://localhost:8000");
+serve(handler, { port: 8000 });
